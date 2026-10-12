@@ -13,6 +13,17 @@ const requireFromHere = createRuntimeRequire(import.meta);
 const TIMEOUT_MS = 30000;
 const GLOBAL_EMBEDDING_KEY = Symbol.for("opencode-mem.embedding.instance");
 const MAX_CACHE_SIZE = 100;
+/**
+ * Per-attempt ceiling for one remote embedding HTTP call. Retries live inside
+ * the outer embedWithTimeout budget (TIMEOUT_MS), so a single hung request
+ * costs one attempt instead of the whole budget (#400: one transient hang
+ * previously aborted an entire import with zero memories written).
+ */
+const REMOTE_ATTEMPT_TIMEOUT_MS = 10000;
+/** Attempts per remote embedding call: 1 try + 2 retries on transient failures. */
+const REMOTE_MAX_ATTEMPTS = 3;
+/** Base backoff between remote embedding attempts; scales linearly (backoffMs * attempt). */
+const REMOTE_RETRY_BACKOFF_MS = 500;
 
 // ONNX weight variants in descending precision, mirroring transformers.js
 // DEFAULT_DTYPE_SUFFIX_MAPPING (utils/dtypes.js). fp32 has no filename suffix.
@@ -243,6 +254,86 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   ]);
 }
 
+/** Remote embedding call failed with an HTTP status. */
+export class EmbeddingHttpError extends Error {
+  constructor(
+    public readonly status: number,
+    statusText: string
+  ) {
+    super(`API embedding failed: ${status} ${statusText}`);
+    this.name = "EmbeddingHttpError";
+  }
+}
+
+/**
+ * Classify an embedding fetch failure as retryable. HTTP 429 and 5xx are
+ * transient server-side conditions; any other HTTP status is a caller error
+ * and must fail fast. Network-level failures and per-attempt timeouts have no
+ * status and are treated as retryable.
+ */
+function isRetryableEmbeddingError(error: unknown): boolean {
+  if (error instanceof EmbeddingHttpError) {
+    return error.status === 429 || error.status >= 500;
+  }
+  return true;
+}
+
+/**
+ * Perform a remote embedding request with bounded retries. Each attempt is
+ * capped at `attemptTimeoutMs` so a hung connection cannot consume the whole
+ * outer embedWithTimeout budget; transient failures (network, timeout, 429,
+ * 5xx) are retried with linear backoff, everything else fails fast.
+ *
+ * `fetchImpl` is injectable for tests.
+ */
+export async function fetchRemoteEmbeddingWithRetry(
+  fetchImpl: typeof fetch,
+  input: string,
+  options: {
+    url?: string;
+    apiKey?: string;
+    model?: string;
+    attemptTimeoutMs?: number;
+    maxAttempts?: number;
+    backoffMs?: number;
+  } = {}
+): Promise<any> {
+  const url = options.url ?? CONFIG.embeddingApiUrl;
+  const apiKey = options.apiKey ?? CONFIG.embeddingApiKey;
+  const model = options.model ?? CONFIG.embeddingModel;
+  const attemptTimeoutMs = options.attemptTimeoutMs ?? REMOTE_ATTEMPT_TIMEOUT_MS;
+  const maxAttempts = options.maxAttempts ?? REMOTE_MAX_ATTEMPTS;
+  const backoffMs = options.backoffMs ?? REMOTE_RETRY_BACKOFF_MS;
+
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await withTimeout(
+        fetchImpl(`${url}/embeddings`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({ input, model }),
+        }),
+        attemptTimeoutMs
+      );
+      if (!response.ok) {
+        throw new EmbeddingHttpError(response.status, response.statusText);
+      }
+      return await response.json();
+    } catch (error) {
+      lastError = error;
+      if (attempt === maxAttempts || !isRetryableEmbeddingError(error)) {
+        throw error instanceof Error ? error : new Error(String(error));
+      }
+      await new Promise((resolve) => setTimeout(resolve, backoffMs * attempt));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
 export class EmbeddingService {
   private pipe: any = null;
   private initPromise: Promise<void> | null = null;
@@ -270,29 +361,11 @@ export class EmbeddingService {
   private async initializeModel(progressCallback?: (progress: any) => void): Promise<void> {
     try {
       if (CONFIG.embeddingApiUrl && CONFIG.embeddingApiKey) {
-        // Send a probe request to verify the API endpoint is actually reachable
-        // Uses a minimal embedding of "ping" to test the full request pipeline
-        const probeResponse = await withTimeout(
-          fetch(`${CONFIG.embeddingApiUrl}/embeddings`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${CONFIG.embeddingApiKey}`,
-            },
-            body: JSON.stringify({
-              input: "ping",
-              model: CONFIG.embeddingModel,
-            }),
-          }),
-          TIMEOUT_MS
-        );
-
-        if (!probeResponse.ok) {
-          throw new Error(
-            `Embedding API health check failed: ${probeResponse.status} ${probeResponse.statusText}`
-          );
-        }
-
+        // Send a probe request to verify the API endpoint is actually reachable.
+        // Uses a minimal embedding of "ping" to test the full request pipeline.
+        // Retried on transient failure (#400): a single hung probe previously
+        // burned the whole 30s budget and set the sticky initError.
+        await fetchRemoteEmbeddingWithRetry(fetch, "ping");
         this.isWarmedUp = true;
         this.initError = null;
         return;
@@ -351,23 +424,7 @@ export class EmbeddingService {
     let result: Float32Array;
 
     if (CONFIG.embeddingApiUrl && CONFIG.embeddingApiKey) {
-      const response = await fetch(`${CONFIG.embeddingApiUrl}/embeddings`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${CONFIG.embeddingApiKey}`,
-        },
-        body: JSON.stringify({
-          input,
-          model: CONFIG.embeddingModel,
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`API embedding failed: ${response.statusText}`);
-      }
-
-      const data: any = await response.json();
+      const data: any = await fetchRemoteEmbeddingWithRetry(fetch, input);
       result = new Float32Array(data.data[0].embedding);
     } else {
       const output = await this.pipe(input, {
