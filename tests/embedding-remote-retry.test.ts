@@ -20,12 +20,28 @@ const RETRY_OPTS = {
 };
 
 describe("fetchRemoteEmbeddingWithRetry", () => {
-  it("recovers when the first attempt hangs past the per-attempt timeout", async () => {
+  it("recovers when the first attempt hangs past the per-attempt AbortSignal timeout", async () => {
     let calls = 0;
-    const fetchImpl = async () => {
+    const fetchImpl = async (_url: unknown, init?: { signal?: AbortSignal }) => {
       calls++;
       if (calls === 1) {
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(init?.signal).toBeDefined();
+        await new Promise<never>((_resolve, reject) => {
+          const signal = init!.signal!;
+          if (signal.aborted) {
+            reject(signal.reason ?? new DOMException("The operation was aborted.", "TimeoutError"));
+            return;
+          }
+          signal.addEventListener(
+            "abort",
+            () => {
+              reject(
+                signal.reason ?? new DOMException("The operation was aborted.", "TimeoutError")
+              );
+            },
+            { once: true }
+          );
+        });
       }
       return jsonResponse(200);
     };
@@ -36,6 +52,52 @@ describe("fetchRemoteEmbeddingWithRetry", () => {
     );
     expect(data.data[0].embedding).toEqual([0.1, 0.2]);
     expect(calls).toBe(2);
+  });
+
+  it("retries on network TypeError and succeeds on a later attempt", async () => {
+    let calls = 0;
+    const fetchImpl = async () => {
+      calls++;
+      if (calls === 1) throw new TypeError("fetch failed");
+      return jsonResponse(200);
+    };
+    const data = await fetchRemoteEmbeddingWithRetry(
+      fetchImpl as unknown as typeof fetch,
+      "hello",
+      RETRY_OPTS
+    );
+    expect(data.data[0].embedding).toEqual([0.1, 0.2]);
+    expect(calls).toBe(2);
+  });
+
+  it("fails fast on invalid JSON without consuming another attempt", async () => {
+    let calls = 0;
+    const fetchImpl = async () => {
+      calls++;
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => {
+          throw new SyntaxError("Unexpected token");
+        },
+      } as unknown as Response;
+    };
+    await expect(
+      fetchRemoteEmbeddingWithRetry(fetchImpl as unknown as typeof fetch, "hello", RETRY_OPTS)
+    ).rejects.toThrow("Invalid embedding API JSON");
+    expect(calls).toBe(1);
+  });
+
+  it("passes AbortSignal.timeout to each fetch attempt", async () => {
+    let seenSignal: AbortSignal | undefined;
+    const fetchImpl = async (_url: unknown, init?: { signal?: AbortSignal }) => {
+      seenSignal = init?.signal;
+      return jsonResponse(200);
+    };
+    await fetchRemoteEmbeddingWithRetry(fetchImpl as unknown as typeof fetch, "hello", RETRY_OPTS);
+    expect(seenSignal).toBeDefined();
+    expect(typeof seenSignal!.aborted).toBe("boolean");
   });
 
   it("retries on 429 and succeeds on a later attempt", async () => {

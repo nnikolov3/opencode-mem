@@ -14,12 +14,13 @@ const TIMEOUT_MS = 30000;
 const GLOBAL_EMBEDDING_KEY = Symbol.for("opencode-mem.embedding.instance");
 const MAX_CACHE_SIZE = 100;
 /**
- * Per-attempt ceiling for one remote embedding HTTP call. Retries live inside
- * the outer embedWithTimeout budget (TIMEOUT_MS), so a single hung request
- * costs one attempt instead of the whole budget (#400: one transient hang
- * previously aborted an entire import with zero memories written).
+ * Per-attempt ceiling for one remote embedding HTTP call. Kept at 8s so
+ * 3 attempts + linear backoff stay under the outer embedWithTimeout budget
+ * (TIMEOUT_MS = 30s). A single hung request costs one attempt instead of the
+ * whole budget (#400: one transient hang previously aborted an entire import
+ * with zero memories written).
  */
-const REMOTE_ATTEMPT_TIMEOUT_MS = 10000;
+const REMOTE_ATTEMPT_TIMEOUT_MS = 8000;
 /** Attempts per remote embedding call: 1 try + 2 retries on transient failures. */
 const REMOTE_MAX_ATTEMPTS = 3;
 /** Base backoff between remote embedding attempts; scales linearly (backoffMs * attempt). */
@@ -266,23 +267,32 @@ export class EmbeddingHttpError extends Error {
 }
 
 /**
- * Classify an embedding fetch failure as retryable. HTTP 429 and 5xx are
- * transient server-side conditions; any other HTTP status is a caller error
- * and must fail fast. Network-level failures and per-attempt timeouts have no
- * status and are treated as retryable.
+ * Classify an embedding fetch failure as retryable. Only transient conditions
+ * are retried: HTTP 429/5xx, per-attempt AbortSignal timeouts, and network
+ * TypeErrors from fetch. JSON parse errors, other 4xx, and unexpected errors
+ * fail fast so programming/shape bugs are not amplified across attempts.
  */
 function isRetryableEmbeddingError(error: unknown): boolean {
   if (error instanceof EmbeddingHttpError) {
     return error.status === 429 || error.status >= 500;
   }
-  return true;
+  if (error instanceof DOMException) {
+    return error.name === "TimeoutError" || error.name === "AbortError";
+  }
+  // fetch network failures surface as TypeError; AbortSignal.timeout may too
+  // depending on runtime (Bun/Node) — accept TimeoutError/AbortError names.
+  if (error instanceof Error) {
+    if (error.name === "TimeoutError" || error.name === "AbortError") return true;
+    if (error instanceof TypeError) return true;
+  }
+  return false;
 }
 
 /**
- * Perform a remote embedding request with bounded retries. Each attempt is
- * capped at `attemptTimeoutMs` so a hung connection cannot consume the whole
- * outer embedWithTimeout budget; transient failures (network, timeout, 429,
- * 5xx) are retried with linear backoff, everything else fails fast.
+ * Perform a remote embedding request with bounded retries. Each attempt uses
+ * AbortSignal.timeout so a hung connection is cancelled (not orphaned via
+ * Promise.race); transient failures (network, abort/timeout, 429, 5xx) are
+ * retried with linear backoff, everything else fails fast.
  *
  * `fetchImpl` is injectable for tests.
  */
@@ -308,21 +318,23 @@ export async function fetchRemoteEmbeddingWithRetry(
   let lastError: unknown;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const response = await withTimeout(
-        fetchImpl(`${url}/embeddings`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${apiKey}`,
-          },
-          body: JSON.stringify({ input, model }),
-        }),
-        attemptTimeoutMs
-      );
+      const response = await fetchImpl(`${url}/embeddings`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({ input, model }),
+        signal: AbortSignal.timeout(attemptTimeoutMs),
+      });
       if (!response.ok) {
         throw new EmbeddingHttpError(response.status, response.statusText);
       }
-      return await response.json();
+      try {
+        return await response.json();
+      } catch (parseError) {
+        throw new Error("Invalid embedding API JSON", { cause: parseError });
+      }
     } catch (error) {
       lastError = error;
       if (attempt === maxAttempts || !isRetryableEmbeddingError(error)) {
